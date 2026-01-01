@@ -29,8 +29,7 @@ from transformers.cache_utils import (
     Cache,
     DynamicCache,
     EncoderDecoderCache,
-    OffloadedCache,
-    QuantizedCacheConfig,
+    QuantizedCache,
     StaticCache,
 )
 from transformers.configuration_utils import PretrainedConfig
@@ -55,16 +54,71 @@ from transformers.generation.candidate_generator import (
     AssistedCandidateGeneratorDifferentTokenizers,
     CandidateGenerator,
     PromptLookupCandidateGenerator,
-    _crop_past_key_values,
-    _prepare_attention_mask,
-    _prepare_token_type_ids,
 )
+
+# Compatibility shim for transformers >= 4.57 (these were removed from candidate_generator)
+try:
+    from transformers.generation.candidate_generator import (
+        _crop_past_key_values,
+        _prepare_attention_mask,
+        _prepare_token_type_ids,
+    )
+except ImportError:
+    # These functions were removed in transformers 4.57+
+    # _crop_past_key_values is no longer needed as Cache objects handle this internally
+    def _crop_past_key_values(model, past_key_values, max_length):
+        """Crop past key values to max_length. In transformers >= 4.57, Cache handles this internally."""
+        if past_key_values is None:
+            return None
+        if hasattr(past_key_values, "crop"):
+            past_key_values.crop(max_length)
+            return past_key_values
+        # For legacy tuple format, crop each layer
+        new_past = []
+        for layer_past in past_key_values:
+            new_past.append(tuple(past_state[..., :max_length, :] for past_state in layer_past))
+        return tuple(new_past)
+
+    def _prepare_attention_mask(model, attention_mask, num_new_tokens):
+        """Prepare attention mask for new tokens."""
+        if attention_mask is None:
+            return None
+        return torch.cat([
+            attention_mask,
+            attention_mask.new_ones((attention_mask.shape[0], num_new_tokens))
+        ], dim=-1)
+
+    def _prepare_token_type_ids(model, token_type_ids, num_new_tokens):
+        """Prepare token type ids for new tokens."""
+        if token_type_ids is None:
+            return None
+        last_token_type = token_type_ids[:, -1].unsqueeze(-1)
+        return torch.cat([token_type_ids, last_token_type.expand(-1, num_new_tokens)], dim=-1)
+
 from transformers.generation.configuration_utils import (
-    NEED_SETUP_CACHE_CLASSES_MAPPING,
-    QUANT_BACKEND_CLASSES_MAPPING,
     GenerationConfig,
     GenerationMode,
 )
+
+# Compatibility shim for transformers >= 4.57 (these were removed)
+try:
+    from transformers.generation.configuration_utils import (
+        NEED_SETUP_CACHE_CLASSES_MAPPING,
+        QUANT_BACKEND_CLASSES_MAPPING,
+    )
+except ImportError:
+    NEED_SETUP_CACHE_CLASSES_MAPPING = None
+    QUANT_BACKEND_CLASSES_MAPPING = None
+
+# Compatibility shim for transformers >= 4.57 (these were added)
+try:
+    from transformers.generation.configuration_utils import (
+        ALL_STATIC_CACHE_IMPLEMENTATIONS,
+        STATIC_CACHE_IMPLEMENTATIONS,
+    )
+except ImportError:
+    ALL_STATIC_CACHE_IMPLEMENTATIONS = None
+    STATIC_CACHE_IMPLEMENTATIONS = None
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -1002,7 +1056,7 @@ class GenerationMixin:
                     device=device,
                 )
             )
-        if generation_config.forced_decoder_ids is not None:
+        if getattr(generation_config, "forced_decoder_ids", None) is not None:
             # TODO (sanchit): move this exception to GenerationConfig.validate() when TF & FLAX are aligned with PT
             raise ValueError(
                 "You have explicitly specified `forced_decoder_ids`. Please remove the `forced_decoder_ids` argument "
@@ -1722,7 +1776,12 @@ class GenerationMixin:
             generation_config.cache_implementation = None
 
         if generation_config.cache_implementation is not None:
-            if generation_config.cache_implementation in NEED_SETUP_CACHE_CLASSES_MAPPING:
+            # Handle static cache implementations (compatible with both old and new transformers)
+            static_cache_implementations = (
+                ALL_STATIC_CACHE_IMPLEMENTATIONS if ALL_STATIC_CACHE_IMPLEMENTATIONS is not None
+                else (NEED_SETUP_CACHE_CLASSES_MAPPING if NEED_SETUP_CACHE_CLASSES_MAPPING is not None else {})
+            )
+            if generation_config.cache_implementation in static_cache_implementations:
                 if generation_config.cache_implementation == "static" and not self._supports_static_cache:
                     raise ValueError(
                         "This model does not support `cache_implementation='static'`. Please check the following "
@@ -1742,28 +1801,44 @@ class GenerationMixin:
                         "cache, please open an issue and tag @zucchini-nlp."
                     )
 
-                cache_config = (
-                    generation_config.cache_config
-                    if generation_config.cache_config is not None
-                    else QuantizedCacheConfig()
-                )
-                cache_class = QUANT_BACKEND_CLASSES_MAPPING[cache_config.backend]
+                # New API (transformers >= 4.57): cache_config is a dict, use QuantizedCache directly
+                cache_config = generation_config.cache_config if generation_config.cache_config is not None else {}
+                if isinstance(cache_config, dict):
+                    # New transformers API
+                    if "config" not in cache_config:
+                        cache_config["config"] = self.config.get_text_config()
+                    backend = cache_config.pop("backend", "quanto")
 
-                # if cache_config.backend == "quanto" and not (is_optimum_quanto_available() or is_quanto_available()):
-                if cache_config.backend == "quanto" and not is_optimum_quanto_available():
-                    raise ImportError(
-                        "You need to install optimum-quanto in order to use KV cache quantization with optimum-quanto backend. "
-                        "Please install it via  with `pip install optimum-quanto`"
-                    )
-                elif cache_config.backend == "HQQ" and not is_hqq_available():
-                    raise ImportError(
-                        "You need to install `HQQ` in order to use KV cache quantization with HQQ backend. "
-                        "Please install it via  with `pip install hqq`"
-                    )
+                    if backend == "quanto" and not is_optimum_quanto_available():
+                        raise ImportError(
+                            "You need to install optimum-quanto in order to use KV cache quantization with optimum-quanto backend. "
+                            "Please install it via  with `pip install optimum-quanto`"
+                        )
+                    elif backend == "HQQ" and not is_hqq_available():
+                        raise ImportError(
+                            "You need to install `HQQ` in order to use KV cache quantization with HQQ backend. "
+                            "Please install it via  with `pip install hqq`"
+                        )
 
-                model_kwargs[cache_name] = cache_class(cache_config)
+                    model_kwargs[cache_name] = QuantizedCache(backend=backend, **cache_config)
+                else:
+                    # Old transformers API (< 4.57) - cache_config is QuantizedCacheConfig object
+                    cache_class = QUANT_BACKEND_CLASSES_MAPPING[cache_config.backend]
+
+                    if cache_config.backend == "quanto" and not is_optimum_quanto_available():
+                        raise ImportError(
+                            "You need to install optimum-quanto in order to use KV cache quantization with optimum-quanto backend. "
+                            "Please install it via  with `pip install optimum-quanto`"
+                        )
+                    elif cache_config.backend == "HQQ" and not is_hqq_available():
+                        raise ImportError(
+                            "You need to install `HQQ` in order to use KV cache quantization with HQQ backend. "
+                            "Please install it via  with `pip install hqq`"
+                        )
+
+                    model_kwargs[cache_name] = cache_class(cache_config)
             elif generation_config.cache_implementation == "offloaded":
-                model_kwargs[cache_name] = OffloadedCache()
+                model_kwargs[cache_name] = DynamicCache(offloading=True)
 
         # Use DynamicCache() instance by default. This will avoid back and forth from legacy format that
         # keeps copying the cache thus using much more memory
