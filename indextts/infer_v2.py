@@ -34,6 +34,7 @@ import safetensors
 from transformers import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
+import scipy.io.wavfile as wavfile
 
 class IndexTTS2:
     def __init__(
@@ -694,7 +695,8 @@ class IndexTTS2:
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            wav_numpy = wav.squeeze().cpu().numpy()
+            wavfile.write(output_path, sampling_rate, wav_numpy.astype('int16'))
             print(">> wav file saved to:", output_path)
             if stream_return:
                 return None
